@@ -31,86 +31,71 @@ def format_timecode(seconds):
 # === Helper: Draw Eval Bar (16 characters) ===
 def draw_eval_bar(eval_score):
     """
-    Returns an ASCII-based evaluation bar 16 characters wide.
-    Evaluation scores are linearly mapped from -8 to +8:
-      - 0.00 => 8 white blocks, 8 black blocks
-      - +4.00 => ~12 white blocks, 4 black blocks
-      - +8.00 => 16 white blocks; -8.00 => 16 black blocks
-    Uses '█' for the filled (white) portion and '░' for the empty (black) portion.
-    """
-    BAR_LENGTH = 16
-    eval_score = max(min(eval_score, 8), -8)
-    ratio = 0.5 + (eval_score / 16.0)
-    ratio = max(0, min(1, ratio))
-    white_blocks = int(round(ratio * BAR_LENGTH))
-    black_blocks = BAR_LENGTH - white_blocks
-    return "█" * white_blocks + "░" * black_blocks
+    Returns an evaluation bar 24 characters wide using emoji squares:
+      - "⬜" for the filled (white) portion
+      - "⬛" for the empty (black) portion
 
-# === Helper: Emoji Evaluation Conversion ===
-def emoji_eval(eval_score):
+    The evaluation is mapped linearly from -8 to +8:
+      - At 0.00, the bar is half filled.
+      - At +4.00, about 75% filled.
+      - At +8.00, fully filled; at -8.00, fully empty.
+    The range -4..+4 is spread across 90% of the bar (5%-95% fill).
     """
-    Converts a numeric evaluation (formatted as a fixed-width string with a sign)
-    into an emoji representation for each digit.
-    Uses the following mapping:
-      '0': '0️⃣'
-      '1': '1️⃣'
-      '2': '2️⃣'
-      '3': '3️⃣'
-      '4': '4️⃣'
-      '5': '5️⃣'
-      '6': '6️⃣'
-      '7': '7️⃣'
-      '8': '8️⃣'
-      '9': '9️⃣'
-      '.': '.'
-      '-': '➖'
-      '+': '➕'
+    BAR_LENGTH = 24
+    if eval_score >= 8:
+        ratio = 1.0
+    elif eval_score <= -8:
+        ratio = 0.0
+    else:
+        if eval_score >= 4:
+            ratio = 0.95
+        elif eval_score <= -4:
+            ratio = 0.05
+        else:
+            ratio = 0.05 + ((eval_score + 4) / 8.0) * 0.90
+        ratio = max(0.0, min(1.0, ratio))
+    filled = int(round(ratio * BAR_LENGTH))
+    empty = BAR_LENGTH - filled
+    #return "⬜" * filled + "⬛" * empty
+    return "▓" * filled + "░" * empty    
+    
+# === Helper: Convert Numeric Evaluation to Fullwidth Symbols ===
+def fullwidth_eval(eval_score):
+    """
+    Converts a numeric evaluation into fullwidth digits and symbols.
+    Mapping:
+      '0' -> '０'
+      '1' -> '１'
+      '2' -> '２'
+      '3' -> '３'
+      '4' -> '４'
+      '5' -> '５'
+      '6' -> '６'
+      '7' -> '７'
+      '8' -> '８'
+      '9' -> '９'
+      '.' -> '.'
+      '-' -> '－'
+      '+' -> '＋'
+    The evaluation is formatted as a fixed-width string (+5.2f) and then converted.
     """
     mapping = {
-        '0': '0️⃣',
-        '1': '1️⃣',
-        '2': '2️⃣',
-        '3': '3️⃣',
-        '4': '4️⃣',
-        '5': '5️⃣',
-        '6': '6️⃣',
-        '7': '7️⃣',
-        '8': '8️⃣',
-        '9': '9️⃣',
+        '0': '０',
+        '1': '１',
+        '2': '２',
+        '3': '３',
+        '4': '４',
+        '5': '５',
+        '6': '６',
+        '7': '７',
+        '8': '８',
+        '9': '９',
         '.': '.',
-        '-': '➖',
-        '+': '➕'
+        '-': '－',
+        '+': '＋'
     }
-    # Format the evaluation with a plus sign always, fixed width of 5.2f
     formatted = f"{eval_score:+5.2f}"
-    emoji_str = ""
-    for ch in formatted:
-        emoji_str += mapping.get(ch, ch)
-    return emoji_str
-
-# === Helper: Evaluation Description (Not used now) ===
-def eval_description(eval_score):
-    """
-    Returns a textual evaluation description based on the evaluation score.
-    (This function is not used in the current SRT output.)
-    """
-    if -1.0 <= eval_score <= 1.0:
-        desc = "A Partida Está Equilibrada"
-    elif eval_score > 1.0 and eval_score < 2.0:
-        desc = "Vantagem para o Branco"
-    elif eval_score >= 2.0:
-        desc = "Vantagem decisiva para o Branco"
-    elif eval_score < -1.0 and eval_score > -2.0:
-        desc = "Vantagem para o Preto"
-    elif eval_score <= -2.0:
-        desc = "Vantagem decisiva para o Preto"
-    else:
-        desc = "A Partida Está Equilibrada"
-    
-    if eval_score >= 0:
-        return f"{desc} [+{eval_score:5.2f}]"
-    else:
-        return f"{desc} [{eval_score:5.2f}]"
+    return "".join(mapping.get(ch, ch) for ch in formatted)
 
 # === Helper: Read All PGN Files in Current Folder ===
 def get_all_expected_fens():
@@ -147,7 +132,7 @@ def stockfish_worker():
         while True:
             fen = fen_queue.get()
             if fen is None:
-                break  # Stop signal
+                break
             try:
                 board = chess.Board(fen)
                 info = engine.analyse(board, chess.engine.Limit(depth=STOCKFISH_DEPTH))
@@ -219,7 +204,7 @@ def process_video(video_path, expected_fens, evaluated_scores, output_file):
     just before the next FEN change. The previous subtitle ends exactly where the new
     one begins.
     Each subtitle displays the 16-character evaluation bar followed by the numeric 
-    evaluation (converted to emoji digits) in square brackets.
+    evaluation (converted to fullwidth digits) in square brackets.
     """
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -250,7 +235,7 @@ def process_video(video_path, expected_fens, evaluated_scores, output_file):
                         start_tc = format_timecode(current_subtitle_start_sec)
                         end_tc = format_timecode(end_sec)
                         bar = draw_eval_bar(current_eval)
-                        numeric = f"[{emoji_eval(current_eval)}]"
+                        numeric = f"[{fullwidth_eval(current_eval)}]"
                         srt_file.write(f"{subtitle_index}\n{start_tc} --> {end_tc}\n{bar} {numeric}\n\n")
                         srt_file.flush()
                         print(f"Subtitle {subtitle_index}: {start_tc} --> {end_tc} | {bar} {numeric}")
@@ -273,7 +258,7 @@ def process_video(video_path, expected_fens, evaluated_scores, output_file):
         start_tc = format_timecode(current_subtitle_start_sec)
         end_tc = format_timecode(last_sec)
         bar = draw_eval_bar(current_eval)
-        numeric = f"[{emoji_eval(current_eval)}]"
+        numeric = f"[{fullwidth_eval(current_eval)}]"
         srt_file.write(f"{subtitle_index}\n{start_tc} --> {end_tc}\n{bar} {numeric}\n\n")
         srt_file.flush()
         print(f"Subtitle {subtitle_index}: {start_tc} --> {end_tc} | {bar} {numeric}")
@@ -281,46 +266,6 @@ def process_video(video_path, expected_fens, evaluated_scores, output_file):
     srt_file.close()
     cap.release()
     print("Video processing complete.")
-
-def emoji_eval(eval_score):
-    """
-    Converts a numeric evaluation (formatted with a plus sign for positive values)
-    into an emoji string for each digit.
-    Mapping:
-      '0' -> '0️⃣'
-      '1' -> '1️⃣'
-      '2' -> '2️⃣'
-      '3' -> '3️⃣'
-      '4' -> '4️⃣'
-      '5' -> '5️⃣'
-      '6' -> '6️⃣'
-      '7' -> '7️⃣'
-      '8' -> '8️⃣'
-      '9' -> '9️⃣'
-      '.' -> '.'
-      '-' -> '➖'
-      '+' -> '➕'
-    """
-    mapping = {
-        '0': '0️⃣',
-        '1': '1️⃣',
-        '2': '2️⃣',
-        '3': '3️⃣',
-        '4': '4️⃣',
-        '5': '5️⃣',
-        '6': '6️⃣',
-        '7': '7️⃣',
-        '8': '8️⃣',
-        '9': '9️⃣',
-        '.': '.',
-        '-': '➖',
-        '+': '➕'
-    }
-    formatted = f"{eval_score:+5.2f}"
-    result = ""
-    for ch in formatted:
-        result += mapping.get(ch, ch)
-    return result
 
 def main():
     print("Starting Chess Video Analysis")

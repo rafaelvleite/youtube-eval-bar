@@ -9,12 +9,13 @@ import time
 from PIL import Image
 from board_to_fen.predict import get_fen_from_image
 import os
+import pytesseract
 
 # === CONFIGURATION ===
 VIDEO_PATH = "video.mp4"
 STOCKFISH_PATH = "/opt/homebrew/bin/stockfish"
 OUTPUT_SRT = "eval_bar.srt"
-STOCKFISH_DEPTH = 20       # Evaluation depth
+STOCKFISH_DEPTH = 26       # Evaluation depth
 NUM_WORKERS = 8            # Number of Stockfish worker threads
 FRAME_INTERVAL = 60        # Process one frame per second (assuming 60 FPS)
 
@@ -22,25 +23,17 @@ FRAME_INTERVAL = 60        # Process one frame per second (assuming 60 FPS)
 fen_queue = queue.Queue()
 eval_results = {}
 
+# Standard starting FEN (only board layout)
+STANDARD_START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
+
 # === Helper: Format Timecode ===
 def format_timecode(seconds):
     mins, secs = divmod(int(seconds), 60)
     ms = int(round((seconds - int(seconds)) * 1000))
     return f"00:{mins:02}:{secs:02},{ms:03}"
 
-# === Helper: Draw Eval Bar (16 characters) ===
+# === Helper: Draw Eval Bar (24 characters) ===
 def draw_eval_bar(eval_score):
-    """
-    Returns an evaluation bar 24 characters wide using emoji squares:
-      - "⬜" for the filled (white) portion
-      - "⬛" for the empty (black) portion
-
-    The evaluation is mapped linearly from -8 to +8:
-      - At 0.00, the bar is half filled.
-      - At +4.00, about 75% filled.
-      - At +8.00, fully filled; at -8.00, fully empty.
-    The range -4..+4 is spread across 90% of the bar (5%-95% fill).
-    """
     BAR_LENGTH = 24
     if eval_score >= 8:
         ratio = 1.0
@@ -56,29 +49,10 @@ def draw_eval_bar(eval_score):
         ratio = max(0.0, min(1.0, ratio))
     filled = int(round(ratio * BAR_LENGTH))
     empty = BAR_LENGTH - filled
-    #return "⬜" * filled + "⬛" * empty
     return "▓" * filled + "░" * empty    
-    
+
 # === Helper: Convert Numeric Evaluation to Fullwidth Symbols ===
 def fullwidth_eval(eval_score):
-    """
-    Converts a numeric evaluation into fullwidth digits and symbols.
-    Mapping:
-      '0' -> '０'
-      '1' -> '１'
-      '2' -> '２'
-      '3' -> '３'
-      '4' -> '４'
-      '5' -> '５'
-      '6' -> '６'
-      '7' -> '７'
-      '8' -> '８'
-      '9' -> '９'
-      '.' -> '.'
-      '-' -> '－'
-      '+' -> '＋'
-    The evaluation is formatted as a fixed-width string (+5.2f) and then converted.
-    """
     mapping = {
         '0': '０',
         '1': '１',
@@ -101,7 +75,7 @@ def fullwidth_eval(eval_score):
 def get_all_expected_fens():
     """
     Reads all .pgn files in the current folder and builds a dictionary mapping each 
-    cropped FEN (board position only) to a tuple (full_fen, move_number).
+    cropped FEN (board layout only) to a tuple (full_fen, move_number).
     If the same cropped FEN appears in multiple games, the first occurrence is used.
     """
     expected = {}
@@ -122,6 +96,71 @@ def get_all_expected_fens():
                         if cropped_fen not in expected:
                             expected[cropped_fen] = (full_fen, move_num)
     return expected
+
+# === Black Orientation Detection ===
+def detect_black_perspective(roi):
+    """
+    Given a candidate board image (roi), crop a small region from its bottom-right,
+    upscale, threshold, and run OCR in single-character mode (whitelist a-h).
+    Returns True if OCR finds an "a" (indicating Black's perspective), False otherwise.
+    """
+    h, w = roi.shape[:2]
+    crop_size = 30
+    y1 = max(0, h - crop_size)
+    x1 = max(0, w - crop_size)
+    corner = roi[y1:h, x1:w]
+    scale_factor = 2.0
+    new_w = int(corner.shape[1] * scale_factor)
+    new_h = int(corner.shape[0] * scale_factor)
+    corner = cv2.resize(corner, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(corner, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 11, 2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
+    filtered = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    config_str = r"--psm 10 -c tessedit_char_whitelist=abcdefgh"
+    text = pytesseract.image_to_string(filtered, config=config_str).strip().lower()
+    print(f"OCR text in corner: '{text}'")
+    return 'a' in text
+
+# === Chessboard Detection with New Features ===
+def detect_chessboard(frame):
+    """
+    Detects the largest quadrilateral in the frame as the chessboard.
+    Uses OCR on the candidate board region to determine orientation and passes
+    the appropriate black_view parameter to get_fen_from_image.
+    Returns the cropped FEN (board layout only) from get_fen_from_image.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    largest_square = None
+    max_area = 0
+    for cnt in contours:
+        approx = cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
+        if len(approx) == 4:
+            area = cv2.contourArea(approx)
+            if area > max_area:
+                max_area = area
+                largest_square = approx
+    if largest_square is not None:
+        x, y, w, h = cv2.boundingRect(largest_square)
+        candidate_img = frame[y:y+h, x:x+w]
+        # Determine orientation using OCR on candidate_img
+        is_black = detect_black_perspective(candidate_img)
+        orientation = "black" if is_black else "white"
+        print(f"Detected orientation: {orientation}")
+        # Call board_to_fen with black_view parameter accordingly
+        pil_img = Image.fromarray(cv2.cvtColor(candidate_img, cv2.COLOR_BGR2RGB))
+        try:
+            detected_fen = get_fen_from_image(pil_img, black_view=is_black).split(" ")[0]
+            print(f"Detected FEN: {detected_fen}")
+        except Exception as e:
+            print(f"Error in FEN detection: {e}")
+            detected_fen = None
+        return detected_fen
+    print("No chessboard detected in this frame.")
+    return None
 
 # === Stockfish Worker Thread ===
 def stockfish_worker():
@@ -164,47 +203,13 @@ def evaluate_fens_parallel(full_fen_list):
         t.join()
     return eval_results
 
-# === Chessboard Detection ===
-def detect_chessboard(frame):
-    """
-    Detects and extracts the chessboard from a video frame.
-    Uses Canny edge detection and contour analysis to find the largest quadrilateral.
-    Returns the cropped FEN (board layout only) as detected by get_fen_from_image.
-    """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    largest_square = None
-    max_area = 0
-    for cnt in contours:
-        approx = cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
-        if len(approx) == 4:
-            area = cv2.contourArea(approx)
-            if area > max_area:
-                max_area = area
-                largest_square = approx
-    if largest_square is not None:
-        x, y, w, h = cv2.boundingRect(largest_square)
-        board_img = frame[y:y+h, x:x+w]
-        pil_img = Image.fromarray(cv2.cvtColor(board_img, cv2.COLOR_BGR2RGB))
-        try:
-            detected_fen = get_fen_from_image(pil_img)
-            return detected_fen.split(" ")[0]
-        except Exception as e:
-            print(f"Error in FEN detection: {e}")
-            return None
-    print("No chessboard detected in this frame.")
-    return None
-
 # === Process Video and Write SRT Incrementally ===
 def process_video(video_path, expected_fens, evaluated_scores, output_file):
     """
-    Processes the video and writes an SRT entry only when a new FEN is detected.
-    Each subtitle row covers the period from when that FEN is first detected until
-    just before the next FEN change. The previous subtitle ends exactly where the new
-    one begins.
-    Each subtitle displays the 16-character evaluation bar followed by the numeric 
-    evaluation (converted to fullwidth digits) in square brackets.
+    Processes the video and writes an SRT entry when a new FEN is detected.
+    Each subtitle covers the period from when that FEN is first detected until just before the next FEN change.
+    If the detected FEN matches one from the PGN (expected_fens), its evaluation is used.
+    For the starting position, evaluation is forced to 0.0.
     """
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -231,7 +236,7 @@ def process_video(video_path, expected_fens, evaluated_scores, output_file):
                 print(f"Second {current_sec}: Detected FEN: {detected}")
                 if detected != current_subtitle_fen:
                     if current_subtitle_fen is not None and current_subtitle_start_sec is not None:
-                        end_sec = current_sec  # End previous subtitle at current_sec
+                        end_sec = current_sec
                         start_tc = format_timecode(current_subtitle_start_sec)
                         end_tc = format_timecode(end_sec)
                         bar = draw_eval_bar(current_eval)
@@ -242,13 +247,17 @@ def process_video(video_path, expected_fens, evaluated_scores, output_file):
                         subtitle_index += 1
                     current_subtitle_fen = detected
                     current_subtitle_start_sec = current_sec
-                    if detected in expected_fens:
+                    if detected == STANDARD_START:
+                        new_eval = 0.0
+                        print("Standard starting position detected; forcing eval to 0.0")
+                    elif detected in expected_fens:
                         full_fen, move_num = expected_fens[detected]
                         new_eval = evaluated_scores.get(full_fen, 0.0)
-                        current_eval = new_eval
-                        print(f"New FEN (move {move_num}): {detected} with eval {current_eval:.2f}")
+                        print(f"New FEN (move {move_num}): {detected} with eval {new_eval:.2f}")
                     else:
                         print(f"New FEN: {detected} not in expected; using current_eval {current_eval:.2f}")
+                        new_eval = current_eval
+                    current_eval = new_eval
             else:
                 print(f"Second {current_sec}: No FEN detected")
         frame_index += 1

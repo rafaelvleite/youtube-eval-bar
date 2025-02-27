@@ -13,7 +13,6 @@ import pytesseract
 import csv
 
 # === CONFIGURATION ===
-VIDEO_PATH = "video.mp4"
 STOCKFISH_PATH = "/opt/homebrew/bin/stockfish"
 OUTPUT_SRT = "eval_bar.srt"
 STOCKFISH_DEPTH = 26       # Evaluation depth
@@ -27,6 +26,12 @@ eval_results = {}
 
 # Standard starting FEN (only board layout)
 STANDARD_START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
+
+def get_video_files():
+    """
+    Detects all .mp4 files in the current directory and returns a list of them.
+    """
+    return [f for f in os.listdir(".") if f.lower().endswith(".mp4")]
 
 def load_evaluations():
     """
@@ -339,8 +344,13 @@ def main():
     print(f"Extracted {len(expected_fens)} expected moves from PGN files.")
     full_fen_list = [full for full, _ in expected_fens.values()]
     evaluated_scores = evaluate_fens_parallel(full_fen_list)
-    process_video(VIDEO_PATH, expected_fens, evaluated_scores, OUTPUT_SRT)
-    print(f"Subtitles saved: {OUTPUT_SRT}")
+    video_files = get_video_files()
+    if not video_files:
+        print("No .mp4 files found in the current directory.")
+        return
+    for video_file in video_files:
+        print(f"Processing video: {video_file}")
+        process_video(video_file, expected_fens, evaluated_scores, f"{os.path.splitext(video_file)[0]}.srt")
     print("Chess Video Analysis Completed.")
 
 if __name__ == "__main__":

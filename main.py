@@ -10,6 +10,7 @@ from PIL import Image
 from board_to_fen.predict import get_fen_from_image
 import os
 import pytesseract
+import csv
 
 # === CONFIGURATION ===
 VIDEO_PATH = "video.mp4"
@@ -18,6 +19,7 @@ OUTPUT_SRT = "eval_bar.srt"
 STOCKFISH_DEPTH = 26       # Evaluation depth
 NUM_WORKERS = 8            # Number of Stockfish worker threads
 FRAME_INTERVAL = 60        # Process one frame per second (assuming 60 FPS)
+EVAL_CSV_FILE = "evaluations.csv"
 
 # === GLOBALS ===
 fen_queue = queue.Queue()
@@ -25,6 +27,31 @@ eval_results = {}
 
 # Standard starting FEN (only board layout)
 STANDARD_START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
+
+def load_evaluations():
+    """
+    Loads previously computed evaluations from a CSV file.
+    Returns a dictionary {FEN: eval_score}.
+    """
+    evaluations = {}
+    if os.path.exists(EVAL_CSV_FILE):
+        with open(EVAL_CSV_FILE, "r", newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) == 2:
+                    evaluations[row[0]] = float(row[1])  # {FEN: eval_score}
+    print(f"Loaded {len(evaluations)} evaluations from CSV.")
+    return evaluations
+
+def save_evaluations(evaluations):
+    """
+    Saves evaluations to a CSV file.
+    """
+    with open(EVAL_CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        for fen, score in evaluations.items():
+            writer.writerow([fen, score])
+    print(f"Saved {len(evaluations)} evaluations to CSV.")
 
 # === Helper: Format Timecode ===
 def format_timecode(seconds):
@@ -49,8 +76,8 @@ def draw_eval_bar(eval_score):
         ratio = max(0.0, min(1.0, ratio))
     filled = int(round(ratio * BAR_LENGTH))
     empty = BAR_LENGTH - filled
-    return "▓" * filled + "░" * empty    
-
+    return "▓" * filled + "░" * empty
+    
 # === Helper: Convert Numeric Evaluation to Fullwidth Symbols ===
 def fullwidth_eval(eval_score):
     mapping = {
@@ -74,27 +101,43 @@ def fullwidth_eval(eval_score):
 # === Helper: Read All PGN Files in Current Folder ===
 def get_all_expected_fens():
     """
-    Reads all .pgn files in the current folder and builds a dictionary mapping each 
-    cropped FEN (board layout only) to a tuple (full_fen, move_number).
-    If the same cropped FEN appears in multiple games, the first occurrence is used.
+    Reads all .pgn files in the current folder and extracts FENs from both 
+    the mainline moves and variations, ensuring legal move application.
     """
     expected = {}
+
     for filename in os.listdir("."):
         if filename.lower().endswith(".pgn"):
             with open(filename, "r", encoding="latin-1") as f:
                 while True:
                     game = chess.pgn.read_game(f)
                     if game is None:
-                        break
-                    board = game.board()
-                    move_num = 0
-                    for move in game.mainline_moves():
-                        board.push(move)
-                        move_num += 1
-                        full_fen = board.fen()
-                        cropped_fen = full_fen.split(" ")[0]
-                        if cropped_fen not in expected:
-                            expected[cropped_fen] = (full_fen, move_num)
+                        break  # No more games in the file
+
+                    stack = [(game, chess.Board(), 0)]  # (Node, Board, Move Number)
+
+                    while stack:
+                        node, board, move_num = stack.pop()
+
+                        if node.move is not None:  # If not root node
+                            try:
+                                board.push(node.move)  # Apply move safely
+                                move_num += 1
+                                full_fen = board.fen()
+                                cropped_fen = full_fen.split(" ")[0]
+
+                                # Store the first occurrence of each FEN
+                                if cropped_fen not in expected:
+                                    expected[cropped_fen] = (full_fen, move_num)
+                            except Exception as e:
+                                print(f"Warning: Skipping illegal move {node.move} in {board.fen()}")
+                                continue  # Skip bad moves
+
+                        # Push all variations into the stack with a copy of the board
+                        for variation in node.variations:
+                            stack.append((variation, board.copy(), move_num))
+
+    print(f"Extracted {len(expected)} unique positions from PGN files.")
     return expected
 
 # === Black Orientation Detection ===
@@ -180,27 +223,39 @@ def stockfish_worker():
                 print(f"Evaluated FEN: {fen} → Score: {eval_score}")
             except Exception as e:
                 print(f"Stockfish error for FEN {fen}: {e}")
-                eval_results[fen] = None
+                eval_results[fen] = None  # Avoid crashes
             fen_queue.task_done()
 
 def evaluate_fens_parallel(full_fen_list):
     """
-    Evaluates all FENs in parallel using multiple worker threads.
+    Evaluates all FENs in parallel using Stockfish, loading/saving evaluations to CSV.
     """
     global eval_results
-    eval_results = {}
-    workers = []
-    for _ in range(NUM_WORKERS):
-        t = threading.Thread(target=stockfish_worker, daemon=True)
-        t.start()
-        workers.append(t)
-    for fen in full_fen_list:
-        fen_queue.put(fen)
-    fen_queue.join()
-    for _ in range(NUM_WORKERS):
-        fen_queue.put(None)
-    for t in workers:
-        t.join()
+    eval_results = load_evaluations()  # Load existing evaluations
+
+    # Find FENs that still need evaluation
+    fens_to_evaluate = [fen for fen in full_fen_list if fen not in eval_results]
+
+    if fens_to_evaluate:
+        workers = []
+        for _ in range(NUM_WORKERS):
+            t = threading.Thread(target=stockfish_worker, daemon=True)
+            t.start()
+            workers.append(t)
+
+        for fen in fens_to_evaluate:
+            fen_queue.put(fen)
+
+        fen_queue.join()
+
+        for _ in range(NUM_WORKERS):
+            fen_queue.put(None)
+        for t in workers:
+            t.join()
+
+        # Save the newly computed evaluations
+        save_evaluations(eval_results)
+
     return eval_results
 
 # === Process Video and Write SRT Incrementally ===

@@ -2,10 +2,8 @@ import chess
 import chess.pgn
 import chess.engine
 import cv2
-import numpy as np
 import threading
 import queue
-import time
 from PIL import Image
 from board_to_fen.predict import get_fen_from_image
 import os
@@ -14,7 +12,6 @@ import csv
 
 # === CONFIGURATION ===
 STOCKFISH_PATH = "/opt/homebrew/bin/stockfish"
-OUTPUT_SRT = "eval_bar.srt"
 STOCKFISH_DEPTH = 26       # Evaluation depth
 NUM_WORKERS = 8            # Number of Stockfish worker threads
 FRAME_INTERVAL = 60        # Process one frame per second (assuming 60 FPS)
@@ -338,8 +335,6 @@ def process_video(video_path, expected_fens, evaluated_scores, output_file):
 
 def main():
     print("Starting Chess Video Analysis")
-    with open(OUTPUT_SRT, "w") as f:
-        f.write("")
     expected_fens = get_all_expected_fens()
     print(f"Extracted {len(expected_fens)} expected moves from PGN files.")
     full_fen_list = [full for full, _ in expected_fens.values()]
@@ -348,9 +343,18 @@ def main():
     if not video_files:
         print("No .mp4 files found in the current directory.")
         return
+
     for video_file in video_files:
+        srt_file = f"{os.path.splitext(video_file)[0]}.srt"
+        
+        # Skip processing if SRT file already exists
+        if os.path.exists(srt_file):
+            print(f"Skipping {video_file} (SRT file already exists: {srt_file})")
+            continue
+
         print(f"Processing video: {video_file}")
-        process_video(video_file, expected_fens, evaluated_scores, f"{os.path.splitext(video_file)[0]}.srt")
+        process_video(video_file, expected_fens, evaluated_scores, srt_file)
+
     print("Chess Video Analysis Completed.")
 
 if __name__ == "__main__":

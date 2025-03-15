@@ -9,12 +9,13 @@ from board_to_fen.predict import get_fen_from_image
 import os
 import pytesseract
 import csv
+import concurrent.futures
 
 # === CONFIGURATION ===
 STOCKFISH_PATH = "/opt/homebrew/bin/stockfish"
-STOCKFISH_DEPTH = 26       # Evaluation depth
-NUM_WORKERS = 8            # Number of Stockfish worker threads
-FRAME_INTERVAL = 60        # Process one frame per second (assuming 60 FPS)
+STOCKFISH_DEPTH = 26            # Evaluation depth
+NUM_WORKERS = os.cpu_count()
+FRAME_INTERVAL = 60             # Process one frame per second (assuming 60 FPS)
 EVAL_CSV_FILE = "evaluations.csv"
 
 # === GLOBALS ===
@@ -24,45 +25,40 @@ eval_results = {}
 # Standard starting FEN (only board layout)
 STANDARD_START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
 
+# === Helper Functions ===
+
 def get_video_files():
-    """
-    Detects all .mp4 files in the current directory and returns a list of them.
-    """
+    """Detect all .mp4 files in the current directory."""
     return [f for f in os.listdir(".") if f.lower().endswith(".mp4")]
 
 def load_evaluations():
-    """
-    Loads previously computed evaluations from a CSV file.
-    Returns a dictionary {FEN: eval_score}.
-    """
+    """Load previously computed evaluations from a CSV file."""
     evaluations = {}
     if os.path.exists(EVAL_CSV_FILE):
         with open(EVAL_CSV_FILE, "r", newline="", encoding="utf-8") as f:
             reader = csv.reader(f)
             for row in reader:
                 if len(row) == 2:
-                    evaluations[row[0]] = float(row[1])  # {FEN: eval_score}
+                    evaluations[row[0]] = float(row[1])
     print(f"Loaded {len(evaluations)} evaluations from CSV.")
     return evaluations
 
 def save_evaluations(evaluations):
-    """
-    Saves evaluations to a CSV file.
-    """
+    """Save evaluations to a CSV file."""
     with open(EVAL_CSV_FILE, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         for fen, score in evaluations.items():
             writer.writerow([fen, score])
     print(f"Saved {len(evaluations)} evaluations to CSV.")
 
-# === Helper: Format Timecode ===
 def format_timecode(seconds):
+    """Convert seconds to an SRT timecode."""
     mins, secs = divmod(int(seconds), 60)
     ms = int(round((seconds - int(seconds)) * 1000))
     return f"00:{mins:02}:{secs:02},{ms:03}"
 
-# === Helper: Draw Eval Bar (24 characters) ===
 def draw_eval_bar(eval_score):
+    """Draw a bar using 24 characters to represent evaluation score."""
     BAR_LENGTH = 24
     if eval_score >= 8:
         ratio = 1.0
@@ -79,9 +75,9 @@ def draw_eval_bar(eval_score):
     filled = int(round(ratio * BAR_LENGTH))
     empty = BAR_LENGTH - filled
     return "▓" * filled + "░" * empty
-    
-# === Helper: Convert Numeric Evaluation to Fullwidth Symbols ===
+
 def fullwidth_eval(eval_score):
+    """Convert numeric evaluation to fullwidth symbols."""
     mapping = {
         '0': '０',
         '1': '１',
@@ -100,54 +96,44 @@ def fullwidth_eval(eval_score):
     formatted = f"{eval_score:+5.2f}"
     return "".join(mapping.get(ch, ch) for ch in formatted)
 
-# === Helper: Read All PGN Files in Current Folder ===
 def get_all_expected_fens():
     """
-    Reads all .pgn files in the current folder and extracts FENs from both 
-    the mainline moves and variations, ensuring legal move application.
+    Read all PGN files in the current folder and extract FENs from both
+    mainline moves and variations.
     """
     expected = {}
-
     for filename in os.listdir("."):
         if filename.lower().endswith(".pgn"):
             with open(filename, "r", encoding="latin-1") as f:
                 while True:
                     game = chess.pgn.read_game(f)
                     if game is None:
-                        break  # No more games in the file
-
-                    stack = [(game, chess.Board(), 0)]  # (Node, Board, Move Number)
-
+                        break
+                    stack = [(game, chess.Board(), 0)]  # (node, board, move number)
                     while stack:
                         node, board, move_num = stack.pop()
-
-                        if node.move is not None:  # If not root node
+                        if node.move is not None:
                             try:
-                                board.push(node.move)  # Apply move safely
+                                board.push(node.move)
                                 move_num += 1
                                 full_fen = board.fen()
                                 cropped_fen = full_fen.split(" ")[0]
-
-                                # Store the first occurrence of each FEN
                                 if cropped_fen not in expected:
                                     expected[cropped_fen] = (full_fen, move_num)
                             except Exception as e:
                                 print(f"Warning: Skipping illegal move {node.move} in {board.fen()}")
-                                continue  # Skip bad moves
-
-                        # Push all variations into the stack with a copy of the board
+                                continue
                         for variation in node.variations:
                             stack.append((variation, board.copy(), move_num))
-
     print(f"Extracted {len(expected)} unique positions from PGN files.")
     return expected
 
 # === Black Orientation Detection ===
+
 def detect_black_perspective(roi):
     """
     Given a candidate board image (roi), crop a small region from its bottom-right,
     upscale, threshold, and run OCR in single-character mode (whitelist a-h).
-    Returns True if OCR finds an "a" (indicating Black's perspective), False otherwise.
     """
     h, w = roi.shape[:2]
     crop_size = 30
@@ -168,13 +154,13 @@ def detect_black_perspective(roi):
     print(f"OCR text in corner: '{text}'")
     return 'a' in text
 
-# === Chessboard Detection with New Features ===
+# === Chessboard Detection (CPU-Bound) ===
+
 def detect_chessboard(frame):
     """
-    Detects the largest quadrilateral in the frame as the chessboard.
-    Uses OCR on the candidate board region to determine orientation and passes
-    the appropriate black_view parameter to get_fen_from_image.
-    Returns the cropped FEN (board layout only) from get_fen_from_image.
+    Detect the largest quadrilateral in the frame as the chessboard,
+    determine its orientation via OCR, and extract its FEN.
+    This function is CPU-intensive and is offloaded to worker processes.
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
@@ -191,11 +177,9 @@ def detect_chessboard(frame):
     if largest_square is not None:
         x, y, w, h = cv2.boundingRect(largest_square)
         candidate_img = frame[y:y+h, x:x+w]
-        # Determine orientation using OCR on candidate_img
         is_black = detect_black_perspective(candidate_img)
         orientation = "black" if is_black else "white"
         print(f"Detected orientation: {orientation}")
-        # Call board_to_fen with black_view parameter accordingly
         pil_img = Image.fromarray(cv2.cvtColor(candidate_img, cv2.COLOR_BGR2RGB))
         try:
             detected_fen = get_fen_from_image(pil_img, black_view=is_black).split(" ")[0]
@@ -207,11 +191,9 @@ def detect_chessboard(frame):
     print("No chessboard detected in this frame.")
     return None
 
-# === Stockfish Worker Thread ===
+# === Stockfish Evaluation Worker (Unchanged) ===
+
 def stockfish_worker():
-    """
-    Worker thread that evaluates FENs using Stockfish.
-    """
     with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
         while True:
             fen = fen_queue.get()
@@ -225,85 +207,86 @@ def stockfish_worker():
                 print(f"Evaluated FEN: {fen} → Score: {eval_score}")
             except Exception as e:
                 print(f"Stockfish error for FEN {fen}: {e}")
-                eval_results[fen] = None  # Avoid crashes
+                eval_results[fen] = None
             fen_queue.task_done()
 
 def evaluate_fens_parallel(full_fen_list):
-    """
-    Evaluates all FENs in parallel using Stockfish, loading/saving evaluations to CSV.
-    """
+    """Evaluate FENs in parallel using worker threads and save/load CSV evaluations."""
     global eval_results
     eval_results = load_evaluations()  # Load existing evaluations
-
-    # Find FENs that still need evaluation
     fens_to_evaluate = [fen for fen in full_fen_list if fen not in eval_results]
-
     if fens_to_evaluate:
         workers = []
         for _ in range(NUM_WORKERS):
             t = threading.Thread(target=stockfish_worker, daemon=True)
             t.start()
             workers.append(t)
-
         for fen in fens_to_evaluate:
             fen_queue.put(fen)
-
         fen_queue.join()
-
         for _ in range(NUM_WORKERS):
             fen_queue.put(None)
         for t in workers:
             t.join()
-
-        # Save the newly computed evaluations
         save_evaluations(eval_results)
-
     return eval_results
 
-# === Process Video and Write SRT Incrementally ===
-def process_video(video_path, expected_fens, evaluated_scores, output_file):
+# === Multiprocessing Video Processing ===
+
+def process_video_multiprocessing(video_path, expected_fens, evaluated_scores, output_file):
     """
-    Processes the video and writes an SRT entry when a new FEN is detected.
-    Each subtitle covers the period from when that FEN is first detected until just before the next FEN change.
-    If the detected FEN matches one from the PGN (expected_fens), its evaluation is used.
-    For the starting position, evaluation is forced to 0.0.
+    Reads the video and submits every FRAME_INTERVAL frame to a ProcessPoolExecutor
+    for chessboard detection. Then, using the results, it builds SRT segments.
     """
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"Processing Video: {video_path} ({total_frames} frames, {fps} FPS)")
     
+    tasks = []  # List of tuples: (frame_index, second, future)
+    frame_index = 0
+    # Offload detect_chessboard to worker processes.
+    with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_index % FRAME_INTERVAL == 0:
+                current_sec = frame_index // fps
+                future = executor.submit(detect_chessboard, frame)
+                tasks.append((frame_index, current_sec, future))
+            frame_index += 1
+    cap.release()
+    
+    # Process the results and generate SRT segments.
     current_subtitle_fen = None
     current_subtitle_start_sec = None
     current_eval = 0.0
-    subtitle_index = 1
+    subtitle_index = 1  # Skip the first segment as in your original design.
     
-    srt_file = open(output_file, "w")
-    
-    frame_index = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        if frame_index % FRAME_INTERVAL == 0:
-            current_sec = frame_index // fps
-            detected = detect_chessboard(frame)
+    with open(output_file, "w", encoding="utf-8") as srt_file:
+        for frame_idx, sec, future in tasks:
+            detected = future.result()  # Wait for the worker process result.
             if detected:
-                print(f"Second {current_sec}: Detected FEN: {detected}")
+                print(f"Second {sec}: Detected FEN: {detected}")
                 if detected != current_subtitle_fen:
                     if current_subtitle_fen is not None and current_subtitle_start_sec is not None:
-                        end_sec = current_sec
-                        start_tc = format_timecode(current_subtitle_start_sec)
-                        end_tc = format_timecode(end_sec)
-                        bar = draw_eval_bar(current_eval)
-                        numeric = f"[{fullwidth_eval(current_eval)}]"
-                        srt_file.write(f"{subtitle_index}\n{start_tc} --> {end_tc}\n{bar} {numeric}\n\n")
-                        srt_file.flush()
-                        print(f"Subtitle {subtitle_index}: {start_tc} --> {end_tc} | {bar} {numeric}")
-                        subtitle_index += 1
+                        if subtitle_index == 1:
+                            print("Ignoring the first subtitle segment.")
+                            subtitle_index = 2
+                        else:
+                            end_sec = sec
+                            start_tc = format_timecode(current_subtitle_start_sec)
+                            end_tc = format_timecode(end_sec)
+                            bar = draw_eval_bar(current_eval)
+                            numeric = f"[{fullwidth_eval(current_eval)}]"
+                            srt_file.write(f"{subtitle_index}\n{start_tc} --> {end_tc}\n{bar} {numeric}\n\n")
+                            srt_file.flush()
+                            print(f"Subtitle {subtitle_index}: {start_tc} --> {end_tc} | {bar} {numeric}")
+                            subtitle_index += 1
+                    # Start a new segment.
                     current_subtitle_fen = detected
-                    current_subtitle_start_sec = current_sec
+                    current_subtitle_start_sec = sec
                     if detected == STANDARD_START:
                         new_eval = 0.0
                         print("Standard starting position detected; forcing eval to 0.0")
@@ -316,22 +299,20 @@ def process_video(video_path, expected_fens, evaluated_scores, output_file):
                         new_eval = current_eval
                     current_eval = new_eval
             else:
-                print(f"Second {current_sec}: No FEN detected")
-        frame_index += 1
+                print(f"Second {sec}: No FEN detected")
+        last_sec = frame_idx // fps
+        if current_subtitle_fen is not None and current_subtitle_start_sec is not None and subtitle_index > 1:
+            start_tc = format_timecode(current_subtitle_start_sec)
+            end_tc = format_timecode(last_sec)
+            bar = draw_eval_bar(current_eval)
+            numeric = f"[{fullwidth_eval(current_eval)}]"
+            srt_file.write(f"{subtitle_index}\n{start_tc} --> {end_tc}\n{bar} {numeric}\n\n")
+            srt_file.flush()
+            print(f"Subtitle {subtitle_index}: {start_tc} --> {end_tc} | {bar} {numeric}")
     
-    last_sec = frame_index // fps
-    if current_subtitle_fen is not None and current_subtitle_start_sec is not None:
-        start_tc = format_timecode(current_subtitle_start_sec)
-        end_tc = format_timecode(last_sec)
-        bar = draw_eval_bar(current_eval)
-        numeric = f"[{fullwidth_eval(current_eval)}]"
-        srt_file.write(f"{subtitle_index}\n{start_tc} --> {end_tc}\n{bar} {numeric}\n\n")
-        srt_file.flush()
-        print(f"Subtitle {subtitle_index}: {start_tc} --> {end_tc} | {bar} {numeric}")
-    
-    srt_file.close()
-    cap.release()
     print("Video processing complete.")
+
+# === Main Function ===
 
 def main():
     print("Starting Chess Video Analysis")
@@ -346,15 +327,12 @@ def main():
 
     for video_file in video_files:
         srt_file = f"{os.path.splitext(video_file)[0]}.srt"
-        
-        # Skip processing if SRT file already exists
         if os.path.exists(srt_file):
             print(f"Skipping {video_file} (SRT file already exists: {srt_file})")
             continue
-
         print(f"Processing video: {video_file}")
-        process_video(video_file, expected_fens, evaluated_scores, srt_file)
-
+        process_video_multiprocessing(video_file, expected_fens, evaluated_scores, srt_file)
+    
     print("Chess Video Analysis Completed.")
 
 if __name__ == "__main__":

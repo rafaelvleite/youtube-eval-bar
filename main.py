@@ -77,7 +77,11 @@ def draw_eval_bar(eval_score):
     return "▓" * filled + "░" * empty
 
 def fullwidth_eval(eval_score):
-    """Convert numeric evaluation to fullwidth symbols."""
+    """Convert numeric evaluation to fullwidth symbols, or return 'Mate em breve' if eval exceeds threshold."""
+    # Se a avaliação for maior que 20 ou menor que -20, interpretamos como mate.
+    if eval_score > 20 or eval_score < -20:
+        return "Mate vindo"
+    
     mapping = {
         '0': '０',
         '1': '１',
@@ -279,7 +283,7 @@ def process_video_multiprocessing(video_path, expected_fens, evaluated_scores, o
                             start_tc = format_timecode(current_subtitle_start_sec)
                             end_tc = format_timecode(end_sec)
                             bar = draw_eval_bar(current_eval)
-                            numeric = f"[{fullwidth_eval(current_eval)}]"
+                            numeric = f"[{fullwidth_eval(current_eval)}]".replace("[Mate vindo]", "Mate vindo")
                             srt_file.write(f"{subtitle_index}\n{start_tc} --> {end_tc}\n{bar} {numeric}\n\n")
                             srt_file.flush()
                             print(f"Subtitle {subtitle_index}: {start_tc} --> {end_tc} | {bar} {numeric}")

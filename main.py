@@ -13,7 +13,7 @@ import concurrent.futures
 
 # === CONFIGURATION ===
 STOCKFISH_PATH = "/opt/homebrew/bin/stockfish"
-STOCKFISH_DEPTH = 26            # Evaluation depth
+STOCKFISH_DEPTH = 18            # Evaluation depth
 NUM_WORKERS = os.cpu_count()
 FRAME_INTERVAL = 60             # Process one frame per second (assuming 60 FPS)
 EVAL_CSV_FILE = "evaluations.csv"

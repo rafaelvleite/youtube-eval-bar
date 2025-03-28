@@ -216,51 +216,6 @@ def detect_chessboard(frame):
     print("No chessboard detected in this frame.")
     return None
 
-def reconstruct_full_fen(cropped_fen, previous_fen, expected_fens=None, desired_side=None):
-    """
-    Reconstruct a new full FEN from the partial arrangement `cropped_fen` and the `previous_fen`.
-    If `desired_side` is provided (either "w" or "b"), it forces the active color.
-    """
-    # Reject obviously invalid partial FENs.
-    if "model" in cropped_fen.lower() or cropped_fen.count('/') != 7:
-        return None
-
-    # If no previous FEN exists, just construct one using the desired side (default white).
-    if previous_fen is None:
-        side = desired_side if desired_side is not None else "w"
-        new_fen = f"{cropped_fen} {side} - - 0 1"
-        print(f"[DEBUG] No previous FEN => {new_fen}")
-        return new_fen
-
-    prev_parts = previous_fen.split()
-    if len(prev_parts) < 6:
-        side = desired_side if desired_side is not None else "w"
-        new_fen = f"{cropped_fen} {side} - - 0 1"
-        print(f"[DEBUG] Previous invalid => {new_fen}")
-        return new_fen
-
-    if desired_side is not None:
-        side = desired_side
-    else:
-        old_side = prev_parts[1]
-        side = 'w' if old_side == 'b' else 'b'
-
-    new_castling   = prev_parts[2]
-    new_en_passant = '-'
-    old_fullmove   = int(prev_parts[5])
-    new_fullmove = old_fullmove + 1 if side == 'w' else old_fullmove
-
-    new_fen = f"{cropped_fen} {side} {new_castling} {new_en_passant} 0 {new_fullmove}"
-    
-    if expected_fens is not None:
-        key = (cropped_fen, side)
-        if key in expected_fens:
-            print(f"[DEBUG] Reconstruct => desired side works => {new_fen}")
-            return new_fen
-
-    print(f"[DEBUG] Reconstructed FEN (forced side): {new_fen}")
-    return new_fen
-
 def stockfish_worker():
     with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
         while True:
@@ -347,8 +302,6 @@ def process_video_multiprocessing(video_path, expected_fens, evaluated_scores, o
                         subtitle_index += 1
                     current_subtitle_fen = detected
                     current_subtitle_start_sec = sec
-                    # Optionally, reconstruct the full FEN using our helper (if needed)
-                    reconstructed_fen = reconstruct_full_fen(detected, current_subtitle_fen, expected_fens, desired_side=None)
                     if detected == STANDARD_START:
                         new_eval = 0.0
                         print("Standard starting position detected; forcing eval to 0.0")

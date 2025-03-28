@@ -61,7 +61,10 @@ def group_expected_colors(squares_colors):
     return avg_even, avg_odd
 
 def detect_highlighted_squares(squares_colors, min_diff=30, max_diff=120):
-    """Detects highlighted squares by finding the most common board colors (mode) and marking outliers within a reasonable range."""
+    """
+    Detects highlighted squares by finding the two most common board colors and marking outliers.
+    Added safety check: if fewer than 2 common colors are found, returns an empty list.
+    """
     highlighted = []
 
     # Convert colors to tuples for easy counting
@@ -70,10 +73,14 @@ def detect_highlighted_squares(squares_colors, min_diff=30, max_diff=120):
     # Find the two most common colors (light & dark squares)
     common_colors = [np.array(color, dtype=np.float32) for color, _ in color_counts.most_common(2)]
     
+    # Safety check: Ensure there are at least two common colors.
+    if len(common_colors) < 2:
+        print("Not enough common colors detected. Returning an empty list of highlights.")
+        return []
+    
     for color, r, c in squares_colors:
         color = np.array(color, dtype=np.float32)
-
-        # Compute min distance to the two most common board colors
+        # Compute minimum distance to the two most common board colors
         min_dist = min(np.linalg.norm(color - common_colors[0]), np.linalg.norm(color - common_colors[1]))
 
         # Convert to HSV for arrow filtering
@@ -83,14 +90,13 @@ def detect_highlighted_squares(squares_colors, min_diff=30, max_diff=120):
 
         # Ignore arrows (high saturation)
         if saturation > 170:
-            continue  # Likely an arrow or overlay
+            continue
         
-        # If color is significantly different from dominant board colors but not extreme, mark as highlight
+        # Mark square as highlighted if distance is within range
         if min_diff < min_dist < max_diff:
             highlighted.append(((r, c), min_dist))
 
     return highlighted
-
 
 def detect_turn(board_img, save_debug=False):
     """

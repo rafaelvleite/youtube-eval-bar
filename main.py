@@ -10,9 +10,6 @@ import os
 import pytesseract
 import csv
 import concurrent.futures
-import numpy as np
-
-# Import the new API function from your external module.
 from highlighted_squares_detection import detect_turn
 
 # === CONFIGURATION ===
@@ -26,12 +23,10 @@ EVAL_CSV_FILE = "evaluations.csv"
 fen_queue = queue.Queue()
 eval_results = {}
 
-# Standard starting position (piece placement only)
+# Standard starting FEN (only board layout)
 STANDARD_START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
 
-############################################################
-#                  HELPER FUNCTIONS (GENERAL)
-############################################################
+# === Helper Functions ===
 
 def get_video_files():
     """Detect all .mp4 files in the current directory."""
@@ -83,10 +78,9 @@ def draw_eval_bar(eval_score):
     return "▓" * filled + "░" * empty
 
 def fullwidth_eval(eval_score):
-    """Convert numeric evaluation to fullwidth symbols, or return 'Mate vindo' if eval exceeds threshold."""
+    """Convert numeric evaluation to fullwidth symbols, or return 'Mate vindo' if mate."""
     if eval_score > 20 or eval_score < -20:
         return "Mate vindo"
-
     mapping = {
         '0': '０',
         '1': '１',
@@ -105,14 +99,10 @@ def fullwidth_eval(eval_score):
     formatted = f"{eval_score:+5.2f}"
     return "".join(mapping.get(ch, ch) for ch in formatted)
 
-############################################################
-#              PGN PROCESSING & EXPECTED FENS
-############################################################
-
 def get_all_expected_fens():
     """
-    Reads .pgn files to extract FENs from mainline and variations.
-    Positions are stored as keys: (arrangement, side).
+    Read all PGN files in the current folder and extract FENs from both
+    mainline moves and variations.
     """
     expected = {}
     for filename in os.listdir("."):
@@ -122,84 +112,68 @@ def get_all_expected_fens():
                     game = chess.pgn.read_game(f)
                     if game is None:
                         break
-                    stack = [(game, chess.Board(), 0)]  # (node, board, move_num)
+                    board = chess.Board()
+                    stack = [(game, board, 0)]
                     while stack:
                         node, board, move_num = stack.pop()
                         if node.move is not None:
                             try:
                                 board.push(node.move)
                                 move_num += 1
-                                full_fen = board.fen()  # e.g., "rnbqkbnr/ppp... b KQkq - 0 1"
-                                parts = full_fen.split()
-                                if len(parts) >= 2:
-                                    arrangement = parts[0]
-                                    side = parts[1]
-                                    key = (arrangement, side)
-                                    if key not in expected:
-                                        expected[key] = (full_fen, move_num)
+                                full_fen = board.fen()
+                                cropped_fen = full_fen.split(" ")[0]
+                                if cropped_fen not in expected:
+                                    expected[cropped_fen] = (full_fen, move_num)
                             except Exception as e:
                                 print(f"Warning: Skipping illegal move {node.move} in {board.fen()}")
                                 continue
-                        for var in node.variations:
-                            stack.append((var, board.copy(), move_num))
+                        for variation in node.variations:
+                            stack.append((variation, board.copy(), move_num))
     print(f"Extracted {len(expected)} unique positions from PGN files.")
     return expected
 
-############################################################
-#            BLACK ORIENTATION DETECTION
-############################################################
-
-def detect_black_perspective(roi, debug=False):
+def detect_black_perspective(roi):
     """
-    Looks at the bottom-left corner of `roi` to see if it detects 'a1' (white's perspective)
-    or 'a8' (black's perspective). Returns True if black perspective.
+    Given a candidate board image (roi), crop a small region from its bottom-right,
+    upscale, threshold, and run OCR in single-character mode.
     """
     h, w = roi.shape[:2]
     crop_size = 30
-    corner_bl = roi[h - crop_size:h, 0:crop_size]
+    y1 = max(0, h - crop_size)
+    x1 = max(0, w - crop_size)
+    corner = roi[y1:h, x1:w]
+    scale_factor = 2.0
+    new_w = int(corner.shape[1] * scale_factor)
+    new_h = int(corner.shape[0] * scale_factor)
+    corner = cv2.resize(corner, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(corner, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 11, 2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
+    filtered = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    config_str = r"--psm 10 -c tessedit_char_whitelist=abcdefgh"
+    text = pytesseract.image_to_string(filtered, config=config_str).strip().lower()
+    print(f"OCR text in corner: '{text}'")
+    return 'a' in text
 
-    def ocr_corner(image):
-        scale_factor = 2.0
-        new_w = int(image.shape[1] * scale_factor)
-        new_h = int(image.shape[0] * scale_factor)
-        img_up = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-        gray = cv2.cvtColor(img_up, cv2.COLOR_BGR2GRAY)
-        thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 11, 2
-        )
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        filtered = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-        config_str = r"--psm 10 -c tessedit_char_whitelist=abcdefgh12345678"
-        text = pytesseract.image_to_string(filtered, config=config_str).strip().lower()
-        return text
-
-    text_bl = ocr_corner(corner_bl).replace("\n", "")
-    if debug:
-        print(f"[DEBUG] Bottom-left OCR => '{text_bl}'")
-    if 'a8' in text_bl:
-        return True
-    elif 'a1' in text_bl:
-        return False
-    else:
-        if '8' in text_bl and 'a' in text_bl:
-            return True
-        elif 'a' in text_bl or '1' in text_bl:
-            return False
-        elif '8' in text_bl:
-            return True
-    return False
-
-############################################################
-#              CHESSBOARD DETECTION (UPDATED)
-############################################################
+def normalize_fen(fen_str):
+    """
+    Swap the case for all alphabetic characters in the piece-placement part of the FEN.
+    """
+    normalized = ""
+    for ch in fen_str:
+        if ch.isalpha():
+            normalized += ch.lower() if ch.isupper() else ch.upper()
+        else:
+            normalized += ch
+    return normalized
 
 def detect_chessboard(frame):
     """
-    Locate the chessboard in the frame, correct perspective,
-    get the partial FEN, and detect turn using the external API.
-    Returns a dict with keys:
-       - "partial_fen": the piece placement string,
+    Locate the chessboard in the frame, correct its perspective,
+    extract the partial FEN string, and detect turn using the external API.
+    Returns a dictionary with keys:
+       - "partial_fen": the piece placement part of the FEN,
        - "turn_info": turn information.
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -214,37 +188,78 @@ def detect_chessboard(frame):
             if area > max_area:
                 max_area = area
                 largest_square = approx
-
     if largest_square is not None:
         x, y, w, h = cv2.boundingRect(largest_square)
         candidate_img = frame[y:y+h, x:x+w]
         is_black = detect_black_perspective(candidate_img)
         orientation = "black" if is_black else "white"
         print(f"Detected orientation: {orientation}")
-
         try:
             pil_img = Image.fromarray(cv2.cvtColor(candidate_img, cv2.COLOR_BGR2RGB))
             detected_fen = get_fen_from_image(pil_img, black_view=is_black)
             partial_fen = detected_fen.split()[0]
-            print(f"Detected partial FEN: {partial_fen}")
+            print(f"Detected partial FEN before normalization: {partial_fen}")
         except Exception as e:
             print(f"Error in FEN detection: {e}")
             return None
-
-        # Use the external API for turn detection.
+        if partial_fen and partial_fen[0].isupper():
+            print("Detected FEN appears inverted. Normalizing by swapping letter cases...")
+            normalized_fen = normalize_fen(partial_fen)
+            print(f"Normalized partial FEN: {normalized_fen}")
+            partial_fen = normalized_fen
         if detected_fen.startswith(STANDARD_START):
-            turn_info = "White's turn"  # Força o turno para a posição inicial
+            turn_info = "White's turn"
         else:
-            turn_info = detect_turn(candidate_img)        
+            turn_info = detect_turn(candidate_img)
         print(f"Turn detection result: {turn_info}")
         return {"partial_fen": partial_fen, "turn_info": turn_info}
-
     print("No chessboard detected in this frame.")
     return None
 
-############################################################
-#         STOCKFISH EVALUATION WORKER
-############################################################
+def reconstruct_full_fen(cropped_fen, previous_fen, expected_fens=None, desired_side=None):
+    """
+    Reconstruct a new full FEN from the partial arrangement `cropped_fen` and the `previous_fen`.
+    If `desired_side` is provided (either "w" or "b"), it forces the active color.
+    """
+    # Reject obviously invalid partial FENs.
+    if "model" in cropped_fen.lower() or cropped_fen.count('/') != 7:
+        return None
+
+    # If no previous FEN exists, just construct one using the desired side (default white).
+    if previous_fen is None:
+        side = desired_side if desired_side is not None else "w"
+        new_fen = f"{cropped_fen} {side} - - 0 1"
+        print(f"[DEBUG] No previous FEN => {new_fen}")
+        return new_fen
+
+    prev_parts = previous_fen.split()
+    if len(prev_parts) < 6:
+        side = desired_side if desired_side is not None else "w"
+        new_fen = f"{cropped_fen} {side} - - 0 1"
+        print(f"[DEBUG] Previous invalid => {new_fen}")
+        return new_fen
+
+    if desired_side is not None:
+        side = desired_side
+    else:
+        old_side = prev_parts[1]
+        side = 'w' if old_side == 'b' else 'b'
+
+    new_castling   = prev_parts[2]
+    new_en_passant = '-'
+    old_fullmove   = int(prev_parts[5])
+    new_fullmove = old_fullmove + 1 if side == 'w' else old_fullmove
+
+    new_fen = f"{cropped_fen} {side} {new_castling} {new_en_passant} 0 {new_fullmove}"
+    
+    if expected_fens is not None:
+        key = (cropped_fen, side)
+        if key in expected_fens:
+            print(f"[DEBUG] Reconstruct => desired side works => {new_fen}")
+            return new_fen
+
+    print(f"[DEBUG] Reconstructed FEN (forced side): {new_fen}")
+    return new_fen
 
 def stockfish_worker():
     with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
@@ -264,7 +279,6 @@ def stockfish_worker():
             fen_queue.task_done()
 
 def evaluate_fens_parallel(full_fen_list):
-    """Evaluate FENs in parallel using worker threads and update CSV evaluations."""
     global eval_results
     eval_results = load_evaluations()
     fens_to_evaluate = [fen for fen in full_fen_list if fen not in eval_results]
@@ -284,29 +298,18 @@ def evaluate_fens_parallel(full_fen_list):
         save_evaluations(eval_results)
     return eval_results
 
-############################################################
-#         VIDEO PROCESSING + SUBTITLES
-############################################################
-
 def process_video_multiprocessing(video_path, expected_fens, evaluated_scores, output_file):
     """
-    Processa o vídeo frame a frame. A cada FRAME_INTERVAL, detecta o tabuleiro,
-    reconstrói a FEN e obtém a avaliação e informações de turno.
-    Gera segmentos SRT com barras de avaliação e detalhes de turno.
+    Reads the video and submits every FRAME_INTERVAL frame to a ProcessPoolExecutor
+    for chessboard detection. Then, using the results, it builds SRT segments.
     """
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"Processing Video: {video_path} ({total_frames} frames, {fps} FPS)")
-
-    tasks = []  # Cada tarefa é uma tupla: (frame_index, segundo, future)
+    
+    tasks = []  # List of tuples: (frame_index, second, future)
     frame_index = 0
-    current_subtitle_fen = None
-    current_subtitle_start_sec = None
-    current_eval = 0.0
-    current_turn = "Unknown"
-    subtitle_index = 1
-
     with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
         while True:
             ret, frame = cap.read()
@@ -318,101 +321,71 @@ def process_video_multiprocessing(video_path, expected_fens, evaluated_scores, o
                 tasks.append((frame_index, current_sec, future))
             frame_index += 1
     cap.release()
-
+    
+    current_subtitle_fen = None
+    current_subtitle_start_sec = None
+    current_eval = 0.0
+    subtitle_index = 1
+    
     with open(output_file, "w", encoding="utf-8") as srt_file:
         for frame_idx, sec, future in tasks:
-            result = future.result()
+            result = future.result()  # Expecting a dict or None
             if result:
-                partial_fen = result.get("partial_fen")
+                detected = result.get("partial_fen")
                 turn_info = result.get("turn_info")
-                # Se a posição for a inicial, força o turno para as brancas.
-                if partial_fen.startswith(STANDARD_START):
-                    turn_info = "White's turn"
-                desired_side = "w" if turn_info == "White's turn" else "b" if turn_info == "Black's turn" else None
-                if partial_fen:
-                    key = (partial_fen, desired_side)
-                    new_fen = None
-                    if key in expected_fens:
-                        new_fen, move_num = expected_fens[key]
+                print(f"Second {sec}: Detected FEN: {detected}, Turn: {turn_info}")
+                if detected != current_subtitle_fen:
+                    if current_subtitle_fen is not None and current_subtitle_start_sec is not None:
+                        end_sec = sec
+                        start_tc = format_timecode(current_subtitle_start_sec)
+                        end_tc = format_timecode(end_sec)
+                        bar = draw_eval_bar(current_eval)
+                        numeric = f"[{fullwidth_eval(current_eval)}]".replace("[Mate vindo]", "Mate vindo")
+                        srt_file.write(f"{subtitle_index}\n{start_tc} --> {end_tc}\n{bar} {numeric}\n\n")
+                        srt_file.flush()
+                        print(f"Subtitle {subtitle_index}: {start_tc} --> {end_tc} | {bar} {numeric}")
+                        subtitle_index += 1
+                    current_subtitle_fen = detected
+                    current_subtitle_start_sec = sec
+                    # Optionally, reconstruct the full FEN using our helper (if needed)
+                    reconstructed_fen = reconstruct_full_fen(detected, current_subtitle_fen, expected_fens, desired_side=None)
+                    if detected == STANDARD_START:
+                        new_eval = 0.0
+                        print("Standard starting position detected; forcing eval to 0.0")
+                    elif detected in expected_fens:
+                        full_fen, move_num = expected_fens[detected]
+                        new_eval = evaluated_scores.get(full_fen, 0.0)
+                        print(f"New FEN (move {move_num}): {detected} with eval {new_eval:.2f}")
                     else:
-                        print(f"Key {key} not found in expected_fens.")
-                    if new_fen is not None:
-                        print(f"Second {sec}: Reconstructed full FEN: {new_fen}")
-                        if new_fen != current_subtitle_fen:
-                            # Se já existe um segmento anterior, finaliza o segmento atual
-                            if current_subtitle_fen and current_subtitle_start_sec is not None:
-                                end_sec = sec
-                                start_tc = format_timecode(current_subtitle_start_sec)
-                                end_tc = format_timecode(end_sec)
-                                bar = draw_eval_bar(current_eval)
-                                numeric = f"[{fullwidth_eval(current_eval)}]".replace("[Mate vindo]", "Mate vindo")
-                                srt_file.write(
-                                    f"{subtitle_index}\n{start_tc} --> {end_tc}\n{bar} {numeric}\n\n"
-                                )
-                                srt_file.flush()
-                                print(f"Subtitle {subtitle_index}: {start_tc} --> {end_tc} | {bar} {numeric}")
-                                subtitle_index += 1
-                            # Atualiza a posição atual e a hora de início do novo segmento
-                            current_subtitle_fen = new_fen
-                            current_subtitle_start_sec = sec
-                            parts = new_fen.split()
-                            if len(parts) >= 2:
-                                arrangement = parts[0]
-                                side = parts[1]
-                                key_eval = (arrangement, side)
-                                if arrangement == STANDARD_START and side == "w":
-                                    new_eval = 0.0
-                                    print("Standard start => forced eval 0.0")
-                                elif key_eval in expected_fens:
-                                    full_fen, move_num = expected_fens[key_eval]
-                                    new_eval = evaluated_scores.get(full_fen, 0.0)
-                                    print(f"Found expected FEN (move {move_num}): {full_fen} => eval {new_eval:.2f}")
-                                else:
-                                    print(f"Arrangement+side {key_eval} not in expected => reusing {current_eval:.2f}")
-                                    new_eval = current_eval
-                                current_eval = new_eval
+                        print(f"Detected FEN: {detected} not found in expected; using current_eval {current_eval:.2f}")
+                        new_eval = current_eval
+                    current_eval = new_eval
             else:
-                print(f"Second {sec}: No board detected.")
-
+                print(f"Second {sec}: No FEN detected")
         last_sec = frame_index // fps
-        # Gera o último segmento, sem condição para subtitle_index
-        if current_subtitle_fen and current_subtitle_start_sec is not None:
+        if current_subtitle_fen is not None and current_subtitle_start_sec is not None and subtitle_index > 1:
             start_tc = format_timecode(current_subtitle_start_sec)
             end_tc = format_timecode(last_sec)
             bar = draw_eval_bar(current_eval)
             numeric = f"[{fullwidth_eval(current_eval)}]"
-            srt_file.write(
-                f"{subtitle_index}\n{start_tc} --> {end_tc}\n{bar} {numeric}\n\n"
-            )
+            srt_file.write(f"{subtitle_index}\n{start_tc} --> {end_tc}\n{bar} {numeric}\n\n")
             srt_file.flush()
             print(f"Subtitle {subtitle_index}: {start_tc} --> {end_tc} | {bar} {numeric}")
-
+    
     print("Video processing complete.")
-
-############################################################
-#                  MAIN FUNCTION
-############################################################
 
 def main():
     print("Starting Chess Video Analysis")
-    # 1) Collect expected positions from PGN.
     expected_fens = get_all_expected_fens()
-    # Adiciona a posição inicial, se não estiver presente
     if (STANDARD_START, "w") not in expected_fens:
-        # Gera uma FEN completa para a posição inicial, considerando a vez das brancas e a disponibilidade de roques.
-        expected_fens[(STANDARD_START, "w")] = (f"{STANDARD_START} w KQkq - 0 1", 0)
+        expected_fens[STANDARD_START] = (f"{STANDARD_START} w KQkq - 0 1", 0)
     print(f"Extracted {len(expected_fens)} unique positions from PGN files.")
-
-    # 2) Evaluate those positions.
-    full_fen_list = [val[0] for val in expected_fens.values()]
+    full_fen_list = [full for full, _ in expected_fens.values()]
     evaluated_scores = evaluate_fens_parallel(full_fen_list)
-
-    # 3) Process each .mp4 file in the directory.
     video_files = get_video_files()
     if not video_files:
         print("No .mp4 files found in the current directory.")
         return
-
     for video_file in video_files:
         srt_file = f"{os.path.splitext(video_file)[0]}.srt"
         if os.path.exists(srt_file):
@@ -420,7 +393,6 @@ def main():
             continue
         print(f"Processing video: {video_file}")
         process_video_multiprocessing(video_file, expected_fens, evaluated_scores, srt_file)
-
     print("Chess Video Analysis Completed.")
 
 if __name__ == "__main__":

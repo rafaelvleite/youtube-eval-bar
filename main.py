@@ -100,10 +100,6 @@ def fullwidth_eval(eval_score):
     return "".join(mapping.get(ch, ch) for ch in formatted)
 
 def get_all_expected_fens():
-    """
-    Read all PGN files in the current folder and extract FENs from both
-    mainline moves and variations.
-    """
     expected = {}
     for filename in os.listdir("."):
         if filename.lower().endswith(".pgn"):
@@ -112,7 +108,11 @@ def get_all_expected_fens():
                     game = chess.pgn.read_game(f)
                     if game is None:
                         break
-                    board = chess.Board()
+                    # Check for a non-standard starting position in the headers.
+                    if "FEN" in game.headers:
+                        board = chess.Board(game.headers["FEN"])
+                    else:
+                        board = chess.Board()
                     stack = [(game, board, 0)]
                     while stack:
                         node, board, move_num = stack.pop()

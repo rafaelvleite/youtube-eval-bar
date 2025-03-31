@@ -18,6 +18,7 @@ STOCKFISH_DEPTH = 18            # Evaluation depth
 NUM_WORKERS = os.cpu_count() or 4
 FRAME_INTERVAL = 60             # Process one frame per second (assuming 60 FPS)
 EVAL_CSV_FILE = "evaluations.csv"
+USE_TURN_DETECTION = True  # Set to False to skip highlight-based turn detection
 
 # === GLOBALS ===
 fen_queue = queue.Queue()
@@ -207,7 +208,10 @@ def detect_chessboard(frame):
             normalized_fen = normalize_fen(partial_fen)
             print(f"Normalized partial FEN: {normalized_fen}")
             partial_fen = normalized_fen
-        if detected_fen.startswith(STANDARD_START):
+        if not USE_TURN_DETECTION:
+            turn_info = "Unknown turn"
+            print("Turn detection disabled — skipping")
+        elif detected_fen.startswith(STANDARD_START):
             turn_info = "White's turn"
         else:
             turn_info = detect_turn(candidate_img)

@@ -288,7 +288,12 @@ def process_video_multiprocessing(video_path, expected_fens, evaluated_scores, o
     
     with open(output_file, "w", encoding="utf-8") as srt_file:
         for frame_idx, sec, future in tasks:
-            result = future.result()  # Expecting a dict or None
+            try:
+                result = future.result()
+            except Exception as e:
+                print(f"Second {sec}: Error during detection: {e}")
+                continue
+
             if result:
                 detected = result.get("partial_fen")
                 turn_info = result.get("turn_info")
